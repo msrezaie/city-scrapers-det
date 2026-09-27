@@ -1,5 +1,4 @@
 import json
-import logging
 import re
 import string
 from collections import defaultdict
@@ -9,8 +8,6 @@ import pytz
 import scrapy
 from city_scrapers_core.constants import ADVISORY_COMMITTEE, BOARD, COMMITTEE, FORUM
 from city_scrapers_core.items import Meeting
-
-logger = logging.getLogger(__name__)
 
 # Wix Events app that powers the calendar on degc.org/public-authorities
 EVENTS_APP_ID = "140603ad-af8d-84a5-2c80-a0f60cb47351"
@@ -125,10 +122,9 @@ class DetAuthorityMixin:
             yield self._events_request(token, offset=next_offset, events=events)
         else:
             if not events:
-                logger.warning(
-                    "%s: the events API returned no events for %s",
-                    self.name,
-                    self.tab_title,
+                self.logger.warning(
+                    f"The events API returned no events for {self.tab_title}: "
+                    f"{EVENTS_API_URL}"
                 )
             yield scrapy.Request(
                 self.agency_url,
@@ -149,6 +145,8 @@ class DetAuthorityMixin:
             self.tab_title,
             re.sub(r"^Detroit ", "", self.agency),
         ]
+        # An empty keyword would match every title
+        keywords = [k for k in keywords if k]
         pattern = r"\b(?:{})\b".format("|".join(re.escape(k) for k in keywords))
         return bool(re.search(pattern, event["title"], flags=re.I))
 
@@ -160,9 +158,7 @@ class DetAuthorityMixin:
         """
         doc_map = self._parse_document_links(response)
         if not doc_map:
-            logger.warning(
-                "%s: no dated meeting documents found on %s", self.name, response.url
-            )
+            self.logger.warning(f"No dated meeting documents found: {response.url}")
         meetings = self._parse_event_meetings(events)
 
         # Attach documents to events with the same date and title
@@ -242,11 +238,9 @@ class DetAuthorityMixin:
     def _handle_detail_error(self, failure):
         """Keep the meeting from the events API if its detail page can't be read"""
         meeting = failure.request.cb_kwargs["meeting"]
-        logger.warning(
-            "%s: could not read event page %s: %s",
-            self.name,
-            failure.request.url,
-            failure.value,
+        self.logger.warning(
+            f"Could not read the event page, keeping the events API data: "
+            f"{failure.request.url} ({failure.value})"
         )
         yield self._finish_meeting(meeting)
 
@@ -258,7 +252,13 @@ class DetAuthorityMixin:
             .get(EVENTS_APP_ID, {})
             .get("EventsPageInitialState", {})
         )
-        return (page_state.get("event") or {}).get("event")
+        event = (page_state.get("event") or {}).get("event")
+        if not event:
+            self.logger.warning(
+                f"No event data found on the event page, using its rendered "
+                f"About the event section: {response.url}"
+            )
+        return event
 
     def _finish_meeting(self, meeting):
         """Add the video link, status and id to a meeting dict"""
@@ -435,8 +435,10 @@ class DetAuthorityMixin:
             link_text = re.sub(
                 r"[\s​]+", " ", " ".join(link.css("*::text").extract())
             ).strip()
+            if not MEETING_DOC_RE.search(link_text):
+                continue
             doc_date, date_str = self._parse_date(link_text)
-            if not doc_date or not MEETING_DOC_RE.search(link_text):
+            if not doc_date:
                 continue
             link_title = re.sub(r"\s+", " ", link_text.replace(date_str, " ")).strip(
                 " -–,"
@@ -456,12 +458,20 @@ class DetAuthorityMixin:
         else:
             match = NUMERIC_DATE_RE.search(text)
             if not match:
+                self.logger.warning(
+                    f"No date found in the attachment record {text!r}: "
+                    f"{self.agency_url}"
+                )
                 return None, None
             month = int(match.group("month"))
             year = 2000 + int(match.group("year"))
         try:
             return date(year, month, int(match.group("day"))), match.group()
         except ValueError:
+            self.logger.warning(
+                f"Error occurred while parsing the date of the attachment record "
+                f"{text!r}: {self.agency_url}"
+            )
             return None, None
 
     def _parse_title(self, text):

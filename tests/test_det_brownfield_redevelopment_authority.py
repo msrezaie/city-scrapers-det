@@ -153,14 +153,14 @@ def test_detail_page_error_keeps_meeting(spider, caplog):
     assert [i["id"] for i in items] == [
         "det_brownfield_redevelopment_authority/202612161600/x/board_of_directors"
     ]
-    assert "could not read event page" in caplog.text
+    assert "Could not read the event page" in caplog.text
 
 
 def test_empty_documents_page_is_logged(spider, caplog):
     response = documents_response(spider).replace(body=b"")
     with caplog.at_level(logging.WARNING):
         assert list(spider._parse_documents(response)) == []
-    assert "no dated meeting documents found" in caplog.text
+    assert "No dated meeting documents found" in caplog.text
 
 
 def test_start(parsed_items):
