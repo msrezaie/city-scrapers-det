@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 import string
 from collections import defaultdict
@@ -8,6 +9,8 @@ import pytz
 import scrapy
 from city_scrapers_core.constants import ADVISORY_COMMITTEE, BOARD, COMMITTEE, FORUM
 from city_scrapers_core.items import Meeting
+
+logger = logging.getLogger(__name__)
 
 # Wix Events app that powers the calendar on degc.org/public-authorities
 EVENTS_APP_ID = "140603ad-af8d-84a5-2c80-a0f60cb47351"
@@ -121,6 +124,12 @@ class DetAuthorityMixin:
         if paging["count"] and next_offset < paging.get("total", 0):
             yield self._events_request(token, offset=next_offset, events=events)
         else:
+            if not events:
+                logger.warning(
+                    "%s: the events API returned no events for %s",
+                    self.name,
+                    self.tab_title,
+                )
             yield scrapy.Request(
                 self.agency_url,
                 callback=self._parse_documents,
@@ -143,9 +152,17 @@ class DetAuthorityMixin:
         pattern = r"\b(?:{})\b".format("|".join(re.escape(k) for k in keywords))
         return bool(re.search(pattern, event["title"], flags=re.I))
 
-    def _parse_documents(self, response, events):
-        """Combine events with meeting documents and yield meetings"""
+    def _parse_documents(self, response, events=()):
+        """Combine events with meeting documents.
+
+        Meetings from events are completed from their detail pages, meetings that
+        only appear in documents are yielded directly.
+        """
         doc_map = self._parse_document_links(response)
+        if not doc_map:
+            logger.warning(
+                "%s: no dated meeting documents found on %s", self.name, response.url
+            )
         meetings = self._parse_event_meetings(events)
 
         # Attach documents to events with the same date and title
@@ -179,16 +196,83 @@ class DetAuthorityMixin:
                 "CITY_SCRAPERS_ARCHIVE"
             ):
                 continue
-            if self.video_link:
-                meeting["links"].append({"href": self.video_link, "title": "Video"})
-            status_text = " ".join(
-                [meeting.pop("_status_text")]
-                + [link["title"] for link in meeting["links"]]
+            detail_url = meeting.pop("_detail_url", None)
+            if detail_url:
+                yield scrapy.Request(
+                    detail_url,
+                    callback=self._parse_event_detail,
+                    errback=self._handle_detail_error,
+                    cb_kwargs={"meeting": meeting},
+                    dont_filter=True,
+                )
+            else:
+                yield self._finish_meeting(meeting)
+
+    def _parse_event_detail(self, response, meeting):
+        """Add the description and attachments shown on an event's detail page.
+
+        The events API leaves the description out for occurrences of recurring
+        events, but the detail page always has it. The page's "About the event"
+        section is collapsed behind "Show More" in the rendered HTML, so the full
+        text is read from the event data embedded in the page, with the rendered
+        section as a fallback.
+        """
+        event = self._detail_page_event(response)
+        if event:
+            description = self._description_text(
+                event.get("description"), event.get("longDescription")
             )
-            meeting = Meeting(**meeting)
-            meeting["status"] = self._get_status(meeting, text=status_text)
-            meeting["id"] = self._get_id(meeting)
-            yield meeting
+            links = self._parse_event_links(event.get("longDescription"))
+        else:
+            about = response.css('[data-hook="about-section"]')
+            description = "\n".join(
+                re.sub(r"\s+", " ", " ".join(p.css("*::text").getall())).strip()
+                for p in about.css("p, li, h3, h4")
+            ).strip()
+            links = [
+                {"href": response.urljoin(a.attrib["href"]), "title": "Document"}
+                for a in about.css('a[href*="/_files/"]')
+            ]
+        if description:
+            meeting["description"] = description
+        hrefs = [link["href"] for link in meeting["links"]]
+        meeting["links"] += [link for link in links if link["href"] not in hrefs]
+        yield self._finish_meeting(meeting)
+
+    def _handle_detail_error(self, failure):
+        """Keep the meeting from the events API if its detail page can't be read"""
+        meeting = failure.request.cb_kwargs["meeting"]
+        logger.warning(
+            "%s: could not read event page %s: %s",
+            self.name,
+            failure.request.url,
+            failure.value,
+        )
+        yield self._finish_meeting(meeting)
+
+    def _detail_page_event(self, response):
+        """Return the event data embedded in a Wix event detail page"""
+        warmup_data = json.loads(response.css("#wix-warmup-data::text").get() or "{}")
+        page_state = (
+            warmup_data.get("appsWarmupData", {})
+            .get(EVENTS_APP_ID, {})
+            .get("EventsPageInitialState", {})
+        )
+        return (page_state.get("event") or {}).get("event")
+
+    def _finish_meeting(self, meeting):
+        """Add the video link, status and id to a meeting dict"""
+        if self.video_link:
+            meeting["links"].append(
+                {"href": self.video_link, "title": "YouTube channel"}
+            )
+        status_text = " ".join(
+            [meeting.pop("_status_text")] + [link["title"] for link in meeting["links"]]
+        )
+        meeting = Meeting(**meeting)
+        meeting["status"] = self._get_status(meeting, text=status_text)
+        meeting["id"] = self._get_id(meeting)
+        return meeting
 
     def _parse_event_meetings(self, events):
         """Create meeting dicts from events, dropping duplicates.
@@ -210,19 +294,22 @@ class DetAuthorityMixin:
         if event["status"] == "CANCELED":
             status_text += " Cancelled"
         page_url = event.get("eventPageUrl") or {}
+        detail_url = page_url.get("base", "") + page_url.get("path", "")
         return dict(
             title=title,
-            description="",
+            description=self._description_text(
+                event.get("shortDescription"), event.get("description")
+            ),
             classification=self._parse_classification(title),
             start=self._parse_event_start(event),
             end=None,
             time_notes="",
             all_day=False,
             location=self._parse_event_location(event),
-            links=self._parse_event_links(event),
-            source=page_url.get("base", "") + page_url.get("path", "")
-            or self.start_urls[0],
+            links=self._parse_event_links(event.get("description")),
+            source=detail_url or self.start_urls[0],
             _status_text=status_text,
+            _detail_url=detail_url,
         )
 
     def _parse_document_meeting(self, doc_date, title, links):
@@ -274,16 +361,55 @@ class DetAuthorityMixin:
             return TBD_LOCATION
         return {"name": name, "address": address}
 
-    def _parse_event_links(self, event):
-        """Parse Zoom and document links from an event's rich text description"""
+    def _description_text(self, summary, rich_text):
+        """Return an event's description as it's shown on its detail page.
+
+        This is the summary under the title followed by the "About the event"
+        text, which is where attendance details like Zoom links, passcodes and
+        dial-in numbers are posted. Paragraphs that are only an attachment link
+        are left out since those are added to links instead.
+        """
+        lines = []
+        for node in (rich_text or {}).get("nodes", []):
+            for block in self._description_blocks(node):
+                text = self._rich_text(block).replace("\xa0", " ").strip()
+                links = list(self._parse_description_links(block))
+                if (
+                    text
+                    and links
+                    and all("/_files/" in href for _, href in links)
+                    and text == " ".join(link_text for link_text, _ in links)
+                ):
+                    continue
+                # Collapse runs of empty paragraphs into a single blank line
+                if text or (lines and lines[-1]):
+                    lines.append(text)
+        about = "\n".join(lines).strip()
+        summary = (summary or "").strip()
+        return "\n\n".join(part for part in (summary, about) if part)
+
+    def _description_blocks(self, node):
+        """Split a rich text node into the blocks displayed as separate lines"""
+        if node.get("type", "").endswith("_LIST"):
+            for item in node.get("nodes", []):
+                yield from self._description_blocks(item)
+        elif node.get("type") == "LIST_ITEM":
+            for child in node.get("nodes", []):
+                yield from self._description_blocks(child)
+        else:
+            yield node
+
+    def _rich_text(self, node):
+        text = (node.get("textData") or {}).get("text", "")
+        return text + "".join(self._rich_text(c) for c in node.get("nodes", []))
+
+    def _parse_event_links(self, rich_text):
+        """Parse attachment links from an event's rich text description"""
         links = []
-        for text, href in self._parse_description_links(event.get("description")):
-            if "zoom.us/j/" in href:
-                title = "Zoom"
-            elif "/_files/" in href:
-                title = text if text and not text.startswith("http") else "Document"
-            else:
+        for text, href in self._parse_description_links(rich_text):
+            if "/_files/" not in href:
                 continue
+            title = text if text and not text.startswith("http") else "Document"
             if href not in [link["href"] for link in links]:
                 links.append({"href": href, "title": title})
         return links
@@ -321,8 +447,7 @@ class DetAuthorityMixin:
                 link_map[key].append({"href": href, "title": link_title})
         return link_map
 
-    @staticmethod
-    def _parse_date(text):
+    def _parse_date(self, text):
         """Return the first date in a string and the matched text"""
         match = DATE_RE.search(text)
         if match:
@@ -362,8 +487,7 @@ class DetAuthorityMixin:
         name = re.sub(r"\b(transformational )?brownfield plan\b", "", name, flags=re.I)
         return "{} Public Hearing".format(self._clean_title_text(name)).strip()
 
-    @staticmethod
-    def _clean_title_text(text):
+    def _clean_title_text(self, text):
         text = FILLER_WORDS_RE.sub(" ", text)
         text = re.sub(r"[^\w\s]", " ", text)
         text = string.capwords(text.lower())

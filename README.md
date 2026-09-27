@@ -40,8 +40,8 @@ four groups:
   months.
 - **Coverage honesty** (C20) - reports when the spider's own `parse` raised on
   its fixture, because the engine then grades an internal helper instead and the
-  other checks are not covering the path Scrapy calls. Nine of the 21 spiders
-  here are in that state.
+  other checks are not covering the path Scrapy calls. One of the 21 spiders
+  here is in that state.
 - **Source policy** (C16-C19) — no `except: pass` without a log line, no
   spoofed browser user-agent, no hardcoded session cookie, and ids and statuses
   come from `_get_id`/`_get_status` rather than being hand-rolled.

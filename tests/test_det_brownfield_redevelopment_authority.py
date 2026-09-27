@@ -1,6 +1,5 @@
-import json
+import logging
 from datetime import datetime
-from os.path import dirname, join
 
 import pytest
 from city_scrapers_core.constants import (
@@ -11,47 +10,90 @@ from city_scrapers_core.constants import (
     PASSED,
     TENTATIVE,
 )
-from city_scrapers_core.utils import file_response
-from freezegun import freeze_time
+from scrapy import Request
 from scrapy.settings import Settings
+from twisted.python.failure import Failure
 
 from city_scrapers.mixins.det_authority import JEFFERSON_LOCATION, TBD_LOCATION
 from city_scrapers.spiders.det_brownfield_redevelopment_authority import (
     DetBrownfieldRedevelopmentAuthoritySpider,
 )
-
-with open(join(dirname(__file__), "files", "det_authority_events.json")) as f:
-    test_events = json.load(f)["events"]
-test_response = file_response(
-    join(dirname(__file__), "files", "det_brownfield_redevelopment_authority.html"),
-    url="https://www.degc.org/dbra",
+from tests.det_authority_utils import (
+    detail_response,
+    documents_response,
+    find_item,
+    parse_items,
 )
-spider = DetBrownfieldRedevelopmentAuthoritySpider()
-spider.settings = Settings(values={"CITY_SCRAPERS_ARCHIVE": False})
 
-with freeze_time("2026-09-27"):
-    parsed_items = sorted(
-        spider._parse_documents(
-            test_response,
-            events=[e for e in test_events if spider._is_agency_event(e)],
-        ),
-        key=lambda i: (i["start"], i["title"]),
+DETAIL_URL = "https://www.degc.org/event-details/regular-dbra-board-meeting-2026-12-16-16-00"  # noqa
+
+
+@pytest.fixture
+def spider():
+    spider = DetBrownfieldRedevelopmentAuthoritySpider()
+    spider.settings = Settings(values={"CITY_SCRAPERS_ARCHIVE": True})
+    return spider
+
+
+@pytest.fixture(scope="module")
+def parsed_items():
+    return parse_items(
+        DetBrownfieldRedevelopmentAuthoritySpider(), detail_urls=[DETAIL_URL]
     )
 
-board_item = next(i for i in parsed_items if i["start"] == datetime(2026, 9, 23, 16))
-cac_item = next(i for i in parsed_items if i["start"] == datetime(2026, 9, 23, 17))
-hearing_item = next(i for i in parsed_items if i["start"] == datetime(2026, 9, 29, 17))
-lbrf_item = next(i for i in parsed_items if i["start"] == datetime(2026, 6, 10, 15, 45))
-council_hearing_item = next(
-    i for i in parsed_items if i["start"] == datetime(2026, 7, 2)
-)
+
+@pytest.fixture(scope="module")
+def board_item(parsed_items):
+    return find_item(parsed_items, datetime(2026, 9, 23, 16))
 
 
-def test_count():
+@pytest.fixture(scope="module")
+def detail_item(parsed_items):
+    """Recurring meeting whose description is only on its detail page"""
+    return find_item(parsed_items, datetime(2026, 12, 16, 16))
+
+
+@pytest.fixture(scope="module")
+def cac_item(parsed_items):
+    return find_item(parsed_items, datetime(2026, 9, 23, 17))
+
+
+@pytest.fixture(scope="module")
+def hearing_item(parsed_items):
+    return find_item(parsed_items, datetime(2026, 9, 29, 17))
+
+
+@pytest.fixture(scope="module")
+def lbrf_item(parsed_items):
+    return find_item(parsed_items, datetime(2026, 6, 10, 15, 45))
+
+
+@pytest.fixture(scope="module")
+def council_hearing_item(parsed_items):
+    return find_item(parsed_items, datetime(2026, 7, 2))
+
+
+def detail_meeting():
+    return {
+        "title": "Board of Directors",
+        "description": "",
+        "classification": BOARD,
+        "start": datetime(2026, 12, 16, 16),
+        "end": None,
+        "time_notes": "",
+        "all_day": False,
+        "location": JEFFERSON_LOCATION,
+        "links": [],
+        "source": DETAIL_URL,
+        "_status_text": "Regular DBRA Board Meeting",
+    }
+
+
+def test_count(parsed_items):
     assert len(parsed_items) == 114
 
 
-def test_title():
+def test_title(board_item, cac_item, lbrf_item, hearing_item, council_hearing_item):
     assert board_item["title"] == "Board of Directors"
     assert cac_item["title"] == "Community Advisory Committee"
     assert lbrf_item["title"] == "Local Brownfield Revolving Fund Committee"
@@ -65,31 +107,84 @@ def test_title():
     )
 
 
-def test_description():
+def test_description(board_item, detail_item, hearing_item):
     assert board_item["description"] == ""
+    # The events API has no description for this date, the detail page does
+    assert detail_item["description"].startswith(
+        "Join from PC, Mac, iPad, or Android:\n"
+        "https://us06web.zoom.us/j/84843111872?pwd=fauZTbIatYPSOeFUPVS2q0Cs9JyX1s.1\n"
+        "Passcode:241288\n\n"
+        "Phone one-tap:\n"
+    )
+    assert detail_item["description"].endswith(
+        "Webinar ID: 848 4311 1872\n"
+        "International numbers available: https://us06web.zoom.us/u/kw7fMeyk4"
+    )
+    assert hearing_item["description"] == (
+        "Please note that this is an in-person meeting."
+    )
 
 
-def test_start():
+def test_description_without_detail_page():
+    items = parse_items(DetBrownfieldRedevelopmentAuthoritySpider())
+    assert find_item(items, datetime(2026, 12, 16, 16))["description"] == ""
+
+
+def test_detail_page_rendered_fallback(spider):
+    """Use the rendered "About the event" section if the event data is missing"""
+    response = detail_response(spider, DETAIL_URL)
+    response = response.replace(
+        body=response.body.replace(b'id="wix-warmup-data"', b'id="removed"')
+    )
+    item = next(spider._parse_event_detail(response, meeting=detail_meeting()))
+    assert item["description"].startswith(
+        "Join from PC, Mac, iPad, or Android:\n"
+        "https://us06web.zoom.us/j/84843111872?pwd=fauZTbIatYPSOeFUPVS2q0Cs9JyX1s.1\n"
+        "Passcode:241288"
+    )
+
+
+def test_detail_page_error_keeps_meeting(spider, caplog):
+    request = Request(DETAIL_URL, cb_kwargs={"meeting": detail_meeting()})
+    failure = Failure(Exception("timed out"))
+    failure.request = request
+    with caplog.at_level(logging.WARNING):
+        items = list(spider._handle_detail_error(failure))
+    assert [i["id"] for i in items] == [
+        "det_brownfield_redevelopment_authority/202612161600/x/board_of_directors"
+    ]
+    assert "could not read event page" in caplog.text
+
+
+def test_empty_documents_page_is_logged(spider, caplog):
+    response = documents_response(spider).replace(body=b"")
+    with caplog.at_level(logging.WARNING):
+        assert list(spider._parse_documents(response)) == []
+    assert "no dated meeting documents found" in caplog.text
+
+
+def test_start(parsed_items):
     assert parsed_items[0]["start"] == datetime(2025, 10, 2, 17)
 
 
-def test_end():
+def test_end(board_item):
     assert board_item["end"] is None
 
 
-def test_id():
+def test_id(board_item):
     assert (
         board_item["id"]
         == "det_brownfield_redevelopment_authority/202609231600/x/board_of_directors"
     )
 
 
-def test_status():
+def test_status(board_item, detail_item, hearing_item):
     assert board_item["status"] == PASSED
     assert hearing_item["status"] == TENTATIVE
+    assert detail_item["status"] == TENTATIVE
 
 
-def test_location():
+def test_location(parsed_items, board_item, hearing_item, council_hearing_item):
     assert board_item["location"] == JEFFERSON_LOCATION
     assert hearing_item["location"] == {
         "name": "Coleman A. Young Municipal Center",
@@ -102,15 +197,16 @@ def test_location():
     assert council_hearing_item["location"] == TBD_LOCATION
 
 
-def test_source():
+def test_source(board_item, detail_item, council_hearing_item):
     assert (
         board_item["source"]
         == "https://www.degc.org/event-details/regular-dbra-board-meeting-2026-09-23-16-00"  # noqa
     )
+    assert detail_item["source"] == DETAIL_URL
     assert council_hearing_item["source"] == "https://www.degc.org/dbra"
 
 
-def test_links():
+def test_links(board_item, cac_item, hearing_item, detail_item):
     assert board_item["links"] == [
         {
             "href": "https://www.degc.org/_files/ugd/69e7f0_19b21bcae72c4df692ee6be5d46b01f8.pdf",  # noqa
@@ -130,10 +226,6 @@ def test_links():
             "href": "https://www.degc.org/_files/ugd/69e7f0_cccf7234270c4398bc1dfa5b51c28b3a.pdf",  # noqa
             "title": "DBRA-CAC REGULAR MEETING AGENDA",
         },
-        {
-            "href": "https://us06web.zoom.us/j/85246162227?pwd=IMFbNa5dGgBHmFZtT03zmIMpOxXfRr.1",  # noqa
-            "title": "Zoom",
-        },
     ]
     # Documents matched to an event with a different title on the same day
     assert hearing_item["links"] == [
@@ -142,15 +234,16 @@ def test_links():
             "title": "RENAISSANCE CENTER AND RIVEREAST DISTRICT LOCAL PUBLIC HEARING NOTICE",  # noqa
         }
     ]
+    # Zoom details are in the description rather than links
+    assert detail_item["links"] == []
 
 
-def test_classification():
+def test_classification(board_item, cac_item, lbrf_item, hearing_item):
     assert board_item["classification"] == BOARD
     assert cac_item["classification"] == ADVISORY_COMMITTEE
     assert lbrf_item["classification"] == COMMITTEE
     assert hearing_item["classification"] == FORUM
 
 
-@pytest.mark.parametrize("item", parsed_items)
-def test_all_day(item):
-    assert item["all_day"] is False
+def test_all_day(parsed_items):
+    assert all(item["all_day"] is False for item in parsed_items)

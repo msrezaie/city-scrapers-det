@@ -1,97 +1,80 @@
-import json
 from datetime import datetime
-from os.path import dirname, join
 
 import pytest
 from city_scrapers_core.constants import BOARD, PASSED, TENTATIVE
-from city_scrapers_core.utils import file_response
-from freezegun import freeze_time
-from scrapy.settings import Settings
 
 from city_scrapers.mixins.det_authority import GUARDIAN_LOCATION, JEFFERSON_LOCATION
 from city_scrapers.spiders.det_eight_mile_woodward_corridor_improvement_authority import (  # noqa
     DetEightMileWoodwardCorridorImprovementAuthoritySpider,
 )
-
-with open(join(dirname(__file__), "files", "det_authority_events.json")) as f:
-    test_events = json.load(f)["events"]
-test_response = file_response(
-    join(
-        dirname(__file__),
-        "files",
-        "det_eight_mile_woodward_corridor_improvement_authority.html",
-    ),
-    url="https://www.degc.org/emwcia",
-)
-spider = DetEightMileWoodwardCorridorImprovementAuthoritySpider()
-spider.settings = Settings(values={"CITY_SCRAPERS_ARCHIVE": False})
-
-with freeze_time("2026-09-27"):
-    parsed_items = sorted(
-        spider._parse_documents(
-            test_response,
-            events=[e for e in test_events if spider._is_agency_event(e)],
-        ),
-        key=lambda i: (i["start"], i["title"]),
-    )
-
-# Meeting only listed in documents
-doc_item = next(i for i in parsed_items if i["start"] == datetime(2025, 10, 28))
-# Upcoming meeting from the events API
-event_item = next(i for i in parsed_items if i["start"] == datetime(2026, 10, 13, 14))
+from tests.det_authority_utils import find_item, parse_items
 
 
-def test_count():
+@pytest.fixture(scope="module")
+def parsed_items():
+    return parse_items(DetEightMileWoodwardCorridorImprovementAuthoritySpider())
+
+
+@pytest.fixture(scope="module")
+def doc_item(parsed_items):
+    """Meeting only listed in documents"""
+    return find_item(parsed_items, datetime(2025, 10, 28))
+
+
+@pytest.fixture(scope="module")
+def event_item(parsed_items):
+    """Upcoming meeting from the events API"""
+    return find_item(parsed_items, datetime(2026, 10, 13, 14))
+
+
+def test_count(parsed_items):
     assert len(parsed_items) == 16
 
 
-def test_title():
+def test_title(doc_item, event_item):
     assert doc_item["title"] == "Special Board Meeting"
     assert event_item["title"] == "Board of Directors"
 
 
-def test_description():
-    assert event_item["description"] == ""
+def test_description(doc_item):
+    assert doc_item["description"] == ""
 
 
-def test_end():
+def test_end(event_item):
     assert event_item["end"] is None
 
 
-def test_id():
-    assert (
-        event_item["id"]
-        == "det_eight_mile_woodward_corridor_improvement_authority/202610131400/x/board_of_directors"  # noqa
+def test_id(event_item):
+    assert event_item["id"] == (
+        "det_eight_mile_woodward_corridor_improvement_authority/202610131400/x/board_of_directors"  # noqa
     )
 
 
-def test_status():
+def test_status(doc_item, event_item):
     assert doc_item["status"] == PASSED
     assert event_item["status"] == TENTATIVE
 
 
-def test_location():
+def test_location(doc_item, event_item):
     assert doc_item["location"] == GUARDIAN_LOCATION
     assert event_item["location"] == JEFFERSON_LOCATION
 
 
-def test_source():
+def test_source(doc_item, event_item):
     assert doc_item["source"] == "https://www.degc.org/emwcia"
-    assert (
-        event_item["source"]
-        == "https://www.degc.org/event-details/emwcia-board-meeting-2026-10-13-14-00"
+    assert event_item["source"] == (
+        "https://www.degc.org/event-details/emwcia-board-meeting-2026-10-13-14-00"  # noqa
     )
 
 
-def test_links():
+def test_links(doc_item):
     assert doc_item["links"][0]["href"].startswith("https://www.degc.org/_files/")
 
 
-def test_classification():
+def test_classification(doc_item, event_item):
     assert doc_item["classification"] == BOARD
     assert event_item["classification"] == BOARD
 
 
-@pytest.mark.parametrize("item", parsed_items)
-def test_all_day(item):
-    assert item["all_day"] is False
+def test_all_day(parsed_items):
+    assert all(item["all_day"] is False for item in parsed_items)
