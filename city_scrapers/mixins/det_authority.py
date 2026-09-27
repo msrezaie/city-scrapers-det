@@ -8,6 +8,7 @@ import pytz
 import scrapy
 from city_scrapers_core.constants import ADVISORY_COMMITTEE, BOARD, COMMITTEE, FORUM
 from city_scrapers_core.items import Meeting
+from dateutil.relativedelta import relativedelta
 
 # Wix Events app that powers the calendar on degc.org/public-authorities
 EVENTS_APP_ID = "140603ad-af8d-84a5-2c80-a0f60cb47351"
@@ -186,7 +187,10 @@ class DetAuthorityMixin:
         for (doc_date, doc_title), links in doc_map.items():
             meetings.append(self._parse_document_meeting(doc_date, doc_title, links))
 
-        last_year = datetime.today().replace(year=datetime.today().year - 1)
+        # Meeting starts are naive local times, so compare against local time.
+        # relativedelta also handles Feb 29, which .replace(year=...) raises on.
+        now = datetime.now(pytz.timezone(self.timezone)).replace(tzinfo=None)
+        last_year = now - relativedelta(years=1)
         for meeting in meetings:
             if meeting["start"] < last_year and not self.settings.getbool(
                 "CITY_SCRAPERS_ARCHIVE"
